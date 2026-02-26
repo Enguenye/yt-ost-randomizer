@@ -38,6 +38,17 @@ function nowMs(): number {
   return Date.now();
 }
 
+// Parse YouTube ISO 8601 duration like: PT3M12S, PT1H2M, PT45S
+function isoDurationToSeconds(iso: string): number {
+  const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+
+  const hours = parseInt(match?.[1] || "0", 10);
+  const minutes = parseInt(match?.[2] || "0", 10);
+  const seconds = parseInt(match?.[3] || "0", 10);
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
 // ------------------------------
 // Tiny cache in localStorage
 // ------------------------------
@@ -100,7 +111,7 @@ async function youtubeSearch({
   url.searchParams.set("maxResults", String(maxResults));
   url.searchParams.set("safeSearch", "strict");
 
-  // First try with header (some setups support it). If it fails, fallback to ?key=
+  // First try with header; if it fails, fallback to ?key=
   const res = await fetch(url.toString(), {
     method: "GET",
     headers: { "X-goog-api-key": apiKey },
@@ -134,6 +145,38 @@ async function youtubeSearch({
     .filter((v): v is string => Boolean(v));
 }
 
+// Fetch durations for a batch of IDs via videos.list (cheap quota)
+async function fetchVideoDurations(
+  apiKey: string,
+  videoIds: string[],
+  signal?: AbortSignal
+): Promise<Record<string, number>> {
+  if (videoIds.length === 0) return {};
+
+  const url = new URL("https://www.googleapis.com/youtube/v3/videos");
+  url.searchParams.set("part", "contentDetails");
+  url.searchParams.set("id", videoIds.join(","));
+  url.searchParams.set("key", apiKey);
+
+  const res = await fetch(url.toString(), { signal });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Failed to fetch video durations (${res.status}): ${txt}`);
+  }
+
+  const data = (await res.json()) as {
+    items?: Array<{ id: string; contentDetails?: { duration?: string } }>;
+  };
+
+  const durations: Record<string, number> = {};
+  for (const item of data.items || []) {
+    const iso = item.contentDetails?.duration;
+    if (!iso) continue;
+    durations[item.id] = isoDurationToSeconds(iso);
+  }
+  return durations;
+}
+
 // ------------------------------
 // App
 // ------------------------------
@@ -148,6 +191,9 @@ export default function App(): JSX.Element {
   const [resultsPoolN, setResultsPoolN] = useState<number>(10);
   const [suffix, setSuffix] = useState<string>(" OST");
   const [maxVideosPerItem, setMaxVideosPerItem] = useState<number>(1);
+
+  // NEW: Optional max duration filter (minutes). If empty => no filtering.
+  const [maxDurationMinutes, setMaxDurationMinutes] = useState<string>("");
 
   const [status, setStatus] = useState<string>("");
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
@@ -225,13 +271,18 @@ export default function App(): JSX.Element {
 
     const allVideoIds: (string | null)[] = [];
 
+    // Parse max duration once
+    const maxMinutes = parseFloat(maxDurationMinutes);
+    const useMaxDuration = !isNaN(maxMinutes) && maxMinutes > 0;
+    const maxSeconds = useMaxDuration ? maxMinutes * 60 : Infinity;
+
     try {
       for (let i = 0; i < chosen.length; i++) {
         const item = chosen[i];
         const query = `${item}${suffix}`.trim();
 
-        // Cache key depends on query + pool size
-        const cacheKey = `${query}::top${n}`;
+        // Cache key depends on query + pool size + duration filter setting
+        const cacheKey = `${query}::top${n}::max${useMaxDuration ? maxMinutes : "any"}`;
 
         // Use cache if not too old (7 days)
         const cached = getCacheEntry(cacheKey);
@@ -243,14 +294,26 @@ export default function App(): JSX.Element {
           videoIdsPool = cached.videoIds;
         } else {
           setStatus(`Searching (${i + 1}/${chosen.length}): ${query}`);
+
           const ids = await youtubeSearch({
             apiKey: key,
             q: query,
             maxResults: n,
             signal: controller.signal,
           });
-          videoIdsPool = ids;
-          setCacheEntry(cacheKey, { ts: nowMs(), videoIds: ids });
+
+          // Apply optional max-duration filtering (only if user filled it)
+          if (useMaxDuration && ids.length > 0) {
+            const durations = await fetchVideoDurations(key, ids, controller.signal);
+            videoIdsPool = ids.filter((id) => {
+              const s = durations[id];
+              return typeof s === "number" && s <= maxSeconds;
+            });
+          } else {
+            videoIdsPool = ids;
+          }
+
+          setCacheEntry(cacheKey, { ts: nowMs(), videoIds: videoIdsPool });
         }
 
         if (videoIdsPool.length === 0) {
@@ -266,7 +329,9 @@ export default function App(): JSX.Element {
       setPickedVideoIds(cleaned);
 
       if (!cleaned.length) {
-        setStatus("No videos found. Try different suffix/search terms or increase pool size.");
+        setStatus(
+          "No videos found (after filtering). Try increasing Top N, changing suffix, or relaxing the max duration."
+        );
         return;
       }
 
@@ -292,7 +357,7 @@ export default function App(): JSX.Element {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      <h2>YouTube OST Randomizer</h2>
+      <h2>YouTube OST Randomizer (Frontend-only)</h2>
 
       <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
         <label style={{ display: "block", marginBottom: 6 }}>YouTube Data API v3 Key:</label>
@@ -381,6 +446,19 @@ export default function App(): JSX.Element {
               onChange={(e) => setSuffix(e.target.value)}
               style={{ marginLeft: 8, width: "70%" }}
               placeholder=" OST"
+            />
+          </label>
+
+          <label>
+            Maximum duration (minutes):
+            <input
+              type="number"
+              min="0"
+              step="0.5"
+              placeholder="optional"
+              value={maxDurationMinutes}
+              onChange={(e) => setMaxDurationMinutes(e.target.value)}
+              style={{ marginLeft: 8, width: 120 }}
             />
           </label>
         </div>
